@@ -39,7 +39,8 @@ if __name__ == '__main__':
     parser.add_argument('--patch_size', type=int, default=16, help='atch Size')
     parser.add_argument('--stride', type=int, default=8, help='Patch Stride')
     parser.add_argument('--d_model', type=int, default=256)
-
+    parser.add_argument('--patch_sizes', type=str, default='8,16,32', help='multi-scale patch sizes, comma separated, e.g., 8,16,32')
+    parser.add_argument('--strides', type=str, default='4,8,16', help='multi-scale patch strides, comma separated, e.g., 4,8,16')
 
     # METHOD
     parser.add_argument('--revin', type=int, default=1, help='RevIN; True 1 False 0')
