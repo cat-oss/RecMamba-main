@@ -11,28 +11,64 @@ class Model(torch.nn.Module):
     def __init__(self, configs):
         super(Model, self).__init__()
         self.configs = configs
-        self.patch_num = int((configs.seq_len - configs.patch_size) / configs.stride + 2)
-        self.patching = Patching(configs.patch_size, configs.stride, configs.stride)
+
+
+        patch_sizes = getattr(configs, 'patch_sizes', '')
+        strides = getattr(configs, 'strides', '')
+        if isinstance(patch_sizes, str) and patch_sizes.strip() != '':
+            self.patch_sizes = [int(item.strip()) for item in patch_sizes.split(',') if item.strip() != '']
+        else:
+            self.patch_sizes = [configs.patch_size]
+
+        if isinstance(strides, str) and strides.strip() != '':
+            self.strides = [int(item.strip()) for item in strides.split(',') if item.strip() != '']
+        else:
+            self.strides = [configs.stride]
+
+        if len(self.patch_sizes) != len(self.strides):
+            raise ValueError('patch_sizes and strides must have the same number of elements.')
+
+        self.patch_nums = [int((configs.seq_len - patch_size) / stride + 2)
+                           for patch_size, stride in zip(self.patch_sizes, self.strides)]
+        self.scale_num = len(self.patch_sizes)
+        self.patchings = torch.nn.ModuleList([
+            Patching(patch_size, stride, stride) for patch_size, stride in zip(self.patch_sizes, self.strides)
+        ])
 
         if self.configs.revin == 1:
             self.revin_layer = RevIN(self.configs.enc_in)
 
         self.lin1 = torch.nn.Linear(self.configs.seq_len, self.configs.n1)
-        self.lin2 = torch.nn.Linear(self.configs.patch_size, self.configs.n2)
         self.dropout1 = torch.nn.Dropout(self.configs.dropout)
-        self.dropout2 = torch.nn.Dropout(self.configs.dropout)
+
+        self.lin2_layers = torch.nn.ModuleList([
+            torch.nn.Linear(patch_size, self.configs.n2) for patch_size in self.patch_sizes
+        ])
+        self.dropout2_layers = torch.nn.ModuleList([
+            torch.nn.Dropout(self.configs.dropout) for _ in range(self.scale_num)
+        ])
 
         self.mamba1 = Mamba(d_model=self.configs.n1, d_state=self.configs.d_state, d_conv=self.configs.dconv,
                             expand=self.configs.e_fact)
         self.mamba1_r = Mamba(d_model=1, d_state=self.configs.d_state, d_conv=self.configs.dconv,
                               expand=self.configs.e_fact)
-        self.mamba2 = Mamba(d_model=self.configs.n2, d_state=self.configs.d_state, d_conv=self.configs.dconv,
-                            expand=self.configs.e_fact)
-        self.mamba2_r = Mamba(d_model=self.patch_num, d_state=self.configs.d_state, d_conv=self.configs.dconv,
-                              expand=self.configs.e_fact)
 
-        self.head_nf = self.configs.n2 * self.patch_num
-        self.head = FlattenHead(configs.enc_in, self.head_nf, self.configs.n1, head_dropout=configs.head_dropout)
+        self.mamba2_layers = torch.nn.ModuleList([
+            Mamba(d_model=self.configs.n2, d_state=self.configs.d_state, d_conv=self.configs.dconv,
+                  expand=self.configs.e_fact)
+            for _ in range(self.scale_num)
+        ])
+        self.mamba2_r_layers = torch.nn.ModuleList([
+            Mamba(d_model=patch_num, d_state=self.configs.d_state, d_conv=self.configs.dconv,
+                  expand=self.configs.e_fact)
+            for patch_num in self.patch_nums
+        ])
+
+        self.heads = torch.nn.ModuleList([
+            FlattenHead(configs.enc_in, self.configs.n2 * patch_num, self.configs.n1, head_dropout=configs.head_dropout)
+            for patch_num in self.patch_nums
+        ])
+        self.scale_logits = torch.nn.Parameter(torch.zeros(self.scale_num))
         self.lin3 = torch.nn.Linear(2 * self.configs.n1, self.configs.pred_len)
         self.lin4 = torch.nn.Linear(self.configs.n1, self.configs.seq_len)
 
@@ -50,7 +86,7 @@ class Model(torch.nn.Module):
 
         x = torch.permute(x, (0, 2, 1)) # B L D -> B D L
 
-        x_patch, n_vars = self.patching(x) # B D L -> (B * D) N P
+        x_for_patch = x
 
         x = torch.reshape(x, (x.shape[0] * x.shape[1], 1, x.shape[2])) # B D L -> (B * D) 1 L
         x_rep1 = self.lin1(x) # (B * D) 1 L -> (B * D) 1 n1
@@ -59,14 +95,24 @@ class Model(torch.nn.Module):
         x1 = self.mamba1(x_rep1) # (B * D) 1 n1
         x1_r = self.mamba1_r(x_rep1.permute(0, 2, 1)).permute(0, 2, 1) # (B * D) 1 n1
 
-        x_rep2 = self.lin2(x_patch)  # (B * D) N n1 -> (B * D) N n2
-        x_res2 = x_rep2  # (B * D) N n2
-        x_rep2 = self.dropout2(x_rep2)
-        x2 = self.mamba2(x_rep2)  # (B * D) N n2
-        x2_r = self.mamba2_r(x_rep2.permute(0, 2, 1)).permute(0, 2, 1)  # (B * D) N n2
 
-        x = self.head(x2 + x2_r + x_res2)  # (B * D) N n2 -> (B * D) n1
-        # x = self.head(x2 + x2_r)
+        multi_scale_reps = []
+        n_vars = None
+        for idx in range(self.scale_num):
+            x_patch, n_vars = self.patchings[idx](x_for_patch)  # B D L -> (B * D) N P
+            x_rep2 = self.lin2_layers[idx](x_patch)
+            x_res2 = x_rep2
+            x_rep2 = self.dropout2_layers[idx](x_rep2)
+            x2 = self.mamba2_layers[idx](x_rep2)
+            x2_r = self.mamba2_r_layers[idx](x_rep2.permute(0, 2, 1)).permute(0, 2, 1)
+            multi_scale_reps.append(self.heads[idx](x2 + x2_r + x_res2))
+
+        scale_weights = torch.nn.functional.softmax(self.scale_logits, dim=0)
+        x = torch.zeros_like(multi_scale_reps[0])
+        for idx, rep in enumerate(multi_scale_reps):
+            x = x + scale_weights[idx] * rep
+
+
         x = x.reshape(x.shape[0], 1, x.shape[1])  # (B * D) 1 n1
         x = torch.cat([x1 + x1_r, x + x_res1], dim=2)  # (B * D) 1 (2 * n1)
 
